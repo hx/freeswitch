@@ -1,6 +1,6 @@
 // This package provides a control interface into FreeSWITCH over its event socket layer.
 //
-// You can run API commands as you would in the CLI, and register event handlers. That's it.
+// You can run API commands as you would in the CLI, and listen for events.
 //
 // If running on the same machine as FreeSWITCH, the client can read the event socket configuration file,
 // so you won't need to provide connection information.
@@ -46,10 +46,12 @@ type Client struct {
 	conn        net.Conn
 	execLock    sync.Mutex
 	controlLock sync.Mutex
+	replyLock   sync.Mutex
 
 	handlers map[EventName][]EventHandler
 	inbox    chan packet
 	events   chan Event
+	replies  map[string]chan string
 }
 
 // A function that can be registered to handle events.
@@ -91,7 +93,7 @@ func (c *Client) Open() error {
 	case authPacket := <-c.inbox:
 		if authPacket.packetType() == ptAuthRequest {
 			if result, ok := c.exec("auth", *c.password).(*reply); ok {
-				if !result.Ok() {
+				if !result.ok() {
 					return EAuthenticationFailed
 				}
 			} else {
@@ -120,8 +122,8 @@ func (c *Client) Close() error {
 	return c.shutdown()
 }
 
-// Handle the given event with the given handler. Can be called multiple times to register multiple handlers, which will
-// be called simultaneously when an event fires. For CUSTOM events, use OnCustom() instead.
+// Handle the given event with the given handler. It can be called multiple times to register multiple handlers, which
+// will be called simultaneously when an event fires. For CUSTOM events, use OnCustom() instead.
 func (c *Client) On(eventName string, handler EventHandler) {
 	c.on(EventName{eventName, ""}, handler)
 }
@@ -133,8 +135,6 @@ func (c *Client) OnCustom(eventSubclass string, handler EventHandler) {
 
 func (c *Client) on(name EventName, handler EventHandler) {
 	c.controlLock.Lock()
-	defer c.controlLock.Unlock()
-
 	if c.handlers == nil {
 		c.handlers = make(map[EventName][]EventHandler)
 	}
@@ -142,20 +142,41 @@ func (c *Client) on(name EventName, handler EventHandler) {
 		c.consumeEvents()
 	}
 	c.handlers[name] = append(c.handlers[name], handler)
+	c.controlLock.Unlock()
 	c.exec("events plain", name.String())
 }
 
 // Run an API command, and get the response as a string.
 //
 // This is a blocking (synchronous) method. If you want to discard the result, or execute a call asynchronously, use
-// a goroutine. However, the socket will be blocked until your command has finished executing. For concurrent execution,
-// use multiple Client instances.
+// Query().
 func (c *Client) Execute(command string, args ...string) string {
 	if result := c.exec(append([]string{"api", command}, args...)...); result == nil {
 		return ""
 	} else {
 		return result.String()
 	}
+}
+
+// Run an API command, and get the response as a string through the returned channel.
+//
+// See Execute(). This method is identical, but returns a channel through which the result will eventually be passed.
+func (c *Client) Query(command string, args ...string) (result chan string) {
+	c.consumeBackgroundJobs()
+	result = make(chan string, 1)
+	c.replyLock.Lock()
+	defer c.replyLock.Unlock()
+	if response := c.exec(append([]string{"bgapi", command}, args...)...); response != nil {
+		if j, ok := response.(*reply); ok && j.ok() {
+			if jobId := j.jobId(); jobId != "" {
+				c.replies[jobId] = result
+				return
+			}
+		}
+	}
+	result <- ""
+	c.fatal(ECommandFailed)
+	return
 }
 
 // Set the FreeSWITCH hostname, port, password, and connection timeout manually prior to opening a connection.
@@ -174,6 +195,24 @@ func (c *Client) Configure(hostname string, port int, password string, timeout t
 	return nil
 }
 
+func (c *Client) consumeBackgroundJobs() {
+	c.replyLock.Lock()
+	defer c.replyLock.Unlock()
+	if c.replies == nil {
+		c.replies = make(map[string]chan string)
+		c.On("BACKGROUND_JOB", func(e Event) {
+			c.replyLock.Lock()
+			defer c.replyLock.Unlock()
+			if jobId := e.Get("Job-UUID"); jobId != "" {
+				if replyChan := c.replies[jobId]; replyChan != nil {
+					delete(c.replies, jobId)
+					replyChan <- e.Body()
+				}
+			}
+		})
+	}
+}
+
 func (c *Client) shutdown() (err error) {
 	if c.conn != nil {
 		err = c.conn.Close()
@@ -186,6 +225,9 @@ func (c *Client) shutdown() (err error) {
 	if c.events != nil {
 		close(c.events)
 		c.events = nil
+	}
+	if c.replies != nil {
+		c.replies = make(map[string]chan string)
 	}
 	return
 }
@@ -205,7 +247,7 @@ func (c *Client) fatal(err error) {
 
 func (c *Client) exec(words ...string) (result packet) {
 	if c.conn == nil {
-		panic(ENotConnected)
+		panic(ENotConnected) // TODO not this
 	}
 	c.execLock.Lock()
 	defer c.execLock.Unlock()
@@ -214,7 +256,7 @@ func (c *Client) exec(words ...string) (result packet) {
 	if _, err := c.conn.Write(append([]byte(command), '\n', '\n')); err == nil {
 		result = <-c.inbox
 	} else {
-		go c.fatal(err)
+		c.fatal(err)
 	}
 	return
 }
@@ -294,6 +336,7 @@ func (c *Client) consumeEvents() {
 		events := c.events // Avoids a race with the calling function
 		go func() {
 			for event := range events {
+				c.controlLock.Lock()
 				for _, handler := range c.handlers[*event.Name()] {
 					go func(e Event, h EventHandler) {
 						defer func() {
@@ -306,6 +349,7 @@ func (c *Client) consumeEvents() {
 						h(e)
 					}(event, handler)
 				}
+				c.controlLock.Unlock()
 			}
 		}()
 	}

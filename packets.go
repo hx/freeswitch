@@ -14,12 +14,16 @@ type reply struct {
 	*rawPacket
 }
 
-func (r *reply) Ok() bool {
+func (r *reply) ok() bool {
 	return strings.HasPrefix(r.String(), "+OK")
 }
 
 func (r *reply) String() string {
 	return r.headers.get("Reply-Text")
+}
+
+func (r *reply) jobId() (uuid string) {
+	return r.headers.get("Job-UUID")
 }
 
 type disconnectNotice struct { // TODO: read entire packet?

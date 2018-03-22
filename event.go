@@ -2,6 +2,7 @@ package freeswitch
 
 import (
 	"bufio"
+	"io"
 	"net/textproto"
 	"strconv"
 	"strings"
@@ -10,8 +11,17 @@ import (
 
 // Represents an event raised by FreeSWITCH, and will be passed to your event handlers.
 type Event interface {
+	// Get a value from the event body's headers. An empty string will be returned if the given name
+	// is not present in the event.
 	Get(string) string
+
+	// Get the event's body, excluding its headers, as a string.
+	Body() string
+
+	// Returns the name of the event as an EventName.
 	Name() *EventName
+
+	// The time the event was raised, based on the Event-Date-Timestamp header of the event.
 	Timestamp() *time.Time
 }
 
@@ -23,7 +33,8 @@ type EventName struct {
 
 type inboundEvent struct {
 	*rawPacket
-	body headers
+	headers headers
+	body    string
 }
 
 // Returns true if the event name is a custom event (and therefore should have a subclass).
@@ -31,6 +42,7 @@ func (en *EventName) IsCustom() bool {
 	return en.Subclass != ""
 }
 
+// The name of the event as a string, including the "CUSTOM " prefix for custom events.
 func (en *EventName) String() string {
 	if en.IsCustom() {
 		return en.Name + " " + en.Subclass
@@ -39,7 +51,6 @@ func (en *EventName) String() string {
 	}
 }
 
-// Returns the name of the event as an EventName.
 func (ie *inboundEvent) Name() *EventName {
 	return &EventName{
 		Name:     ie.Get("Event-Name"),
@@ -47,21 +58,14 @@ func (ie *inboundEvent) Name() *EventName {
 	}
 }
 
-// Get a value from the event body. An empty string will be returned if the given name is not present in the event.
 func (ie *inboundEvent) Get(name string) string {
-	if ie.body == nil {
-		headers, err := textproto.NewReader(bufio.NewReader(strings.NewReader(ie.rawPacket.body))).ReadMIMEHeader()
-		if err != nil {
-			ie.body = loadHeaders(headers, true)
-		}
-	}
-	if ie.body == nil {
+	ie.read()
+	if ie.headers == nil {
 		return ""
 	}
-	return ie.body.get(name)
+	return ie.headers.get(name)
 }
 
-// The time the event was raised, based on the Event-Date-Timestamp header of the event.
 func (ie *inboundEvent) Timestamp() (ts *time.Time) {
 	timestamp, err := strconv.Atoi(ie.Get("Event-Date-Timestamp"))
 	if err == nil {
@@ -69,4 +73,26 @@ func (ie *inboundEvent) Timestamp() (ts *time.Time) {
 		ts = &t
 	}
 	return
+}
+
+func (ie *inboundEvent) Body() string {
+	ie.read()
+	return ie.body
+}
+
+func (ie *inboundEvent) read() {
+	if ie.headers == nil {
+		reader := bufio.NewReader(strings.NewReader(ie.rawPacket.body))
+		mimeHeaders, err := textproto.NewReader(reader).ReadMIMEHeader()
+		if err == nil || err == io.EOF {
+			ie.headers = loadHeaders(mimeHeaders, true)
+			if contentLength, err := strconv.Atoi(ie.headers.get("Content-Length")); err == nil && contentLength > 0 {
+				body := make([]byte, contentLength)
+				io.ReadFull(reader, body)
+				ie.body = string(body)
+			}
+		} else {
+			ie.headers = headers{&header{"Event-Name", err.Error()}}
+		}
+	}
 }

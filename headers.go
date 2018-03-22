@@ -9,8 +9,8 @@ import (
 type headers []*header
 
 type header struct {
-	Name  string
-	Value string
+	name  string
+	value string
 }
 
 func (h *headers) add(name, value string) {
@@ -26,7 +26,7 @@ func (h *headers) set(name, value string) {
 func (h headers) get(name string) string {
 	for _, header := range h {
 		if header.matchName(name) {
-			return header.Value
+			return header.value
 		}
 	}
 	return ""
@@ -48,7 +48,7 @@ func (h *headers) del(name string) {
 func (h headers) getAll(name string) (values []string) {
 	for _, header := range h {
 		if header.matchName(name) {
-			values = append(values, header.Value)
+			values = append(values, header.value)
 		}
 	}
 	return
@@ -73,11 +73,11 @@ func (h *headers) load(mh textproto.MIMEHeader, unescape bool) {
 }
 
 func (h *header) matchName(name string) bool {
-	return strings.ToLower(name) == strings.ToLower(h.Name)
+	return strings.ToLower(name) == strings.ToLower(h.name)
 }
 
 func (h *header) String() string {
-	return h.Name + ": " + h.Value + "\n"
+	return h.name + ": " + h.value + "\n"
 }
 
 func loadHeaders(mh textproto.MIMEHeader, unescape bool) headers {
