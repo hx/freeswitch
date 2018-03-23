@@ -13,7 +13,7 @@ var standardConfigPaths = []string{
 }
 
 // Try to guess the event socket configuration based on the standard installation paths of FreeSWITCH's configuration.
-func (c *Client) GuessConfiguration() {
+func (c *Client) guessConfiguration() {
 	for _, path := range standardConfigPaths {
 		if c.ReadConfiguration(path) == nil {
 			return
@@ -62,14 +62,14 @@ func (c *Client) ReadConfiguration(freeswitchConfPath string) error {
 		switch k {
 		case "listen-port":
 			if v, err := strconv.Atoi(v); err == nil {
-				c.port = uint16(v)
+				c.Port = uint16(v)
 			} else {
 				return err
 			}
 		case "listen-ip":
-			c.hostname = v
+			c.Hostname = v
 		case "password":
-			c.password = &v
+			c.Password = v
 		}
 	}
 	return nil

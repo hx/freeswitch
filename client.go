@@ -8,13 +8,13 @@ package freeswitch
 
 import (
 	"bufio"
-	"errors"
 	"io"
 	"net"
 	"net/textproto"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,104 +22,230 @@ const (
 	defaultPort     uint16 = 8021
 	defaultPassword        = "ClueCon"
 	defaultHostname        = "localhost"
-	defaultTimeout         = 3 * time.Second
+	defaultTimeout         = 5 * time.Second
 )
 
-// Represents a connection to FreeSWITCH's event socket. A zero client is valid, and if its Open() method is called,
-// it will use the default hostname, port, and password values of localhost, 8021, and ClueCon.
+// Represents a connection to FreeSWITCH's event socket layer. A zero Client is not valid; use NewClient().
 type Client struct {
+	// The hostname or IP address to which the client should connect (default "localhost").
+	Hostname string
 
-	// Optional. Called when the client is disconnected without calling Close().
-	OnDisconnect func(error)
+	// The port of the host machine to which the client should connect (default 8021).
+	Port uint16
 
-	// Optional. Called when an event handler panics.
-	OnEventHandlerPanic func(event Event, handler EventHandler, err interface{})
+	// The FreeSWITCH event socket password (default "ClueCon").
+	Password string
+
+	// Timeout to use for connection and then for authentication (default 5 seconds).
+	Timeout time.Duration
 
 	//Optional. Called when sending and receiving data to/from FreeSWITCH.
 	Logger func(packet string, isOutbound bool)
 
-	hostname string
-	port     uint16
-	password *string
-	timeout  time.Duration
-
-	conn        net.Conn
-	execLock    sync.Mutex
-	controlLock sync.Mutex
-	replyLock   sync.Mutex
-
+	conn     net.Conn
+	inbox    chan *rawPacket
+	outbox   chan *command
+	errors   chan error
+	reading  chan struct{}
+	running  int32
 	handlers map[EventName][]EventHandler
-	inbox    chan packet
-	events   chan Event
-	replies  map[string]chan string
+	control  sync.Mutex
+	cancel   chan struct{}
+	jobs     map[string]chan string // use jobsJock when reading/writing
+	jobsLock sync.Mutex
+	tickets  chan struct{}
 }
 
 // A function that can be registered to handle events.
 type EventHandler func(Event)
 
-// Connect to and authenticate with the FreeSWITCH event socket. An error will be returned if connection or
-// authentication fails.
-func (c *Client) Open() error {
-	c.controlLock.Lock()
-	defer c.controlLock.Unlock()
+type command struct {
+	command  []string
+	response chan packet
+}
 
+// Make a new client with the default hostname, password, port, and timeout. Client will attempt to read
+// FreeSWITCH's event socket configuration file to obtain connection details.
+func NewClient() (c *Client) {
+	c = &Client{
+		Hostname: defaultHostname,
+		Password: defaultPassword,
+		Port:     defaultPort,
+		Timeout:  defaultTimeout,
+
+		tickets:  make(chan struct{}),
+		handlers: map[EventName][]EventHandler{{"BACKGROUND_JOB", ""}: {c.bgJobDone}},
+	}
+	c.guessConfiguration()
+	return
+}
+
+// Connect to FreeSWITCH and block until disconnection. Call this method in its own goroutine, and call Shutdown()
+// to make it return with no error.
+func (c *Client) Connect() (err error) {
+	c.control.Lock()
+	defer c.control.Unlock()
+
+	// Make sure we're not already connected.
 	if c.conn != nil {
 		return EAlreadyConnected
 	}
-	if c.port == 0 {
-		c.port = defaultPort
-	}
-	if c.hostname == "" {
-		c.hostname = defaultHostname
-	}
-	if c.password == nil {
-		password := defaultPassword
-		c.password = &password
-	}
-	if c.timeout == 0 {
-		c.timeout = defaultTimeout
-	}
-	conn, err := net.DialTimeout("tcp", c.hostname+":"+strconv.Itoa(int(c.port)), c.timeout)
-	if err != nil {
-		return err
+
+	// Some sanity checks
+	if c.Hostname == "" {
+		return EBlankHostname
 	}
 
-	c.conn = conn
-	c.inbox = make(chan packet)
+	// Set up maps and channels
+	c.reset()
 
-	go c.consumePackets()
+	// Attempt TCP connection to FreeSWITCH
+	if c.conn, err = net.DialTimeout("tcp", c.Hostname+":"+strconv.Itoa(int(c.Port)), c.Timeout); err == nil {
 
-	select {
-	case authPacket := <-c.inbox:
-		if authPacket.packetType() == ptAuthRequest {
-			if result, ok := c.exec("auth", *c.password).(*reply); ok {
-				if !result.ok() {
-					return EAuthenticationFailed
-				}
+		// Start reading packets from FS and pumping them into the inbox channel. This process can be interrupted
+		// by closing the connection, then waiting on the `reading` channel for it to exit.
+		go c.consumePackets()
+
+		// This timeout will cover authentication and event subscription
+		handshakeTimeout := time.After(c.Timeout)
+
+		// Wait the given timeout for FreeSWITCH to request authentication and, when requested, send it a password.
+		select {
+		case authPacket := <-c.inbox:
+			if authPacket.packetType() == ptAuthRequest {
+				err = c.write("auth", c.Password)
 			} else {
-				return EUnexpectedResponse
+				err = EUnexpectedResponse
 			}
-		} else {
-			return EUnexpectedResponse
+		case <-handshakeTimeout:
+			err = ETimeout
 		}
-	case <-time.After(c.timeout):
-		return ETimeout
+
+		// Still within the auth timeout, wait for an authentication response, and set an error if it fails.
+		if err == nil {
+			select {
+			case authResponse := <-c.inbox:
+				if result, ok := authResponse.cast().(*reply); !ok || !result.ok() {
+					err = EAuthenticationFailed
+				}
+			case <-handshakeTimeout:
+				err = ETimeout
+			}
+		}
+
+		// Listen to events for already-defined event handlers.
+		if err == nil && len(c.handlers) > 0 {
+			names := make([]EventName, 0, len(c.handlers))
+			for n := range c.handlers {
+				names = append(names, n)
+			}
+
+			// Send the command and wait for FreeSWITCH to acknowledge the message
+			if err = c.write(eventsSubscriptionCommand(names...)...); err == nil {
+				select {
+				case response := <-c.inbox:
+					if result, ok := response.cast().(*reply); !ok || !result.ok() {
+						err = ECommandFailed
+					}
+				case <-handshakeTimeout:
+					err = ETimeout
+				}
+			}
+		}
+
+		// Begin normal operation
+		if err == nil {
+
+			// Commands will wait in this queue to receive their responses
+			var commandFifo []*command
+
+			// Allow other goroutines to put the client into an error state
+			atomic.StoreInt32(&c.running, 1)
+
+			// Allow other goroutines to take control of the client
+			c.control.Unlock()
+
+			// This is the normal operation loop
+			for err == nil {
+				select {
+
+				// A goroutine wants to write to the connection. During connection and handshake, it'll block until
+				// it gets one of these.
+				case c.tickets <- struct{}{}:
+
+				// This will break the loop
+				case err = <-c.errors:
+
+				// We've received an inbound packet from FreeSWITCH
+				case inbound := <-c.inbox:
+					switch p := inbound.cast().(type) {
+					case *inboundEvent:
+						var handlers []EventHandler
+						exclusive(&c.control, func() {
+							handlers = c.handlers[*p.Name()][:]
+						})
+						for _, handler := range handlers {
+							go func(e Event, h EventHandler) {
+								// TODO: recover from panics
+								h(e)
+							}(p, handler)
+						}
+					case *disconnectNotice:
+						go c.close(EDisconnected) // This may be ignored if the socket closes before this error reaches the loop
+					default:
+						if len(commandFifo) > 0 {
+							cmd := commandFifo[0]
+							commandFifo = commandFifo[1:]
+							cmd.response <- p
+						} else {
+							// TODO what to do with discarded packets?
+						}
+					}
+
+				// We need to send a packet to freeswitch
+				case outbound := <-c.outbox:
+					commandFifo = append(commandFifo, outbound)
+					if err = c.write(outbound.command...); err != nil {
+						go c.close(err)
+					}
+
+				}
+			}
+
+			// Take control back from other goroutines
+			c.control.Lock()
+
+			// Cancel pending commands that haven't yet received their responses
+			for _, cmd := range commandFifo {
+				cmd.response <- nil
+			}
+		}
+
+		// If something is waiting to send a command to the outbox, give it the bad news. There should only be one,
+		// because only one ticket should be issued per loop cycle.
+		c.cancel <- struct{}{}
+
+		// Close the connection
+		c.conn.Close()
+		c.conn = nil
+
+		// Wait for the consumePackets() goroutine to finish
+		<-c.reading
 	}
 
-	c.consumeEvents()
-
-	return nil
+	// Normalise the exit error.
+	if err == EShutdown {
+		err = nil
+	}
+	return
 }
 
-// Close the connection to FreeSWITCH.
-func (c *Client) Close() error {
-	c.controlLock.Lock()
-	defer c.controlLock.Unlock()
-
-	if c.conn == nil {
-		return ENotConnected
-	}
-	return c.shutdown()
+// Close the connection to FreeSWITCH and return from Connect().
+func (c *Client) Shutdown() {
+	c.control.Lock()
+	defer c.control.Unlock()
+	c.close(EShutdown)
+	// No need to block here. Another connection attempt will wait for the control lock.
 }
 
 // Handle the given event with the given handler. It can be called multiple times to register multiple handlers, which
@@ -133,137 +259,133 @@ func (c *Client) OnCustom(eventSubclass string, handler EventHandler) {
 	c.on(EventName{"CUSTOM", eventSubclass}, handler)
 }
 
-func (c *Client) on(name EventName, handler EventHandler) {
-	c.controlLock.Lock()
-	if c.handlers == nil {
-		c.handlers = make(map[EventName][]EventHandler)
-	}
-	if c.conn != nil {
-		c.consumeEvents()
-	}
-	c.handlers[name] = append(c.handlers[name], handler)
-	c.controlLock.Unlock()
-	c.exec("events plain", name.String())
-}
-
 // Run an API command, and get the response as a string.
 //
 // This is a blocking (synchronous) method. If you want to discard the result, or execute a call asynchronously, use
 // Query().
-func (c *Client) Execute(command string, args ...string) string {
-	if result := c.exec(append([]string{"api", command}, args...)...); result == nil {
-		return ""
-	} else {
-		return result.String()
+func (c *Client) Execute(app string, args ...string) (result string, err error) {
+	if err = c.waitForTicket(); err != nil {
+		return
 	}
+	err = ENotConnected
+	cmd := &command{command: append([]string{"api", app}, args...)}
+	if c.sendCommand(cmd) {
+		if response := <-cmd.response; response != nil {
+			return response.String(), nil
+		}
+	}
+	return
+}
+
+// Same as Execute(), but panics if an error occurs.
+func (c *Client) MustExecute(app string, args ...string) string {
+	result, err := c.Execute(app, args...)
+	if err != nil {
+		panic(err)
+	}
+	return result
 }
 
 // Run an API command, and get the response as a string through the returned channel.
 //
 // See Execute(). This method is identical, but returns a channel through which the result will eventually be passed.
-func (c *Client) Query(command string, args ...string) (result chan string) {
-	c.consumeBackgroundJobs()
-	result = make(chan string, 1)
-	c.replyLock.Lock()
-	defer c.replyLock.Unlock()
-	if response := c.exec(append([]string{"bgapi", command}, args...)...); response != nil {
-		if j, ok := response.(*reply); ok && j.ok() {
-			if jobId := j.jobId(); jobId != "" {
-				c.replies[jobId] = result
-				return
-			}
+func (c *Client) Query(app string, args ...string) (ch chan string, err error) {
+	if err = c.waitForTicket(); err != nil {
+		return
+	}
+	var (
+		jobId      = uniqId()
+		cmd        = &command{command: append([]string{"bgapi", app}, args...)}
+		resultChan = make(chan string, 1)
+	)
+	cmd.command[(len(cmd.command) - 1)] += "\nJob-UUID: " + jobId
+	exclusive(&c.jobsLock, func() { c.jobs[jobId] = resultChan })
+	err = ENotConnected
+	if c.sendCommand(cmd) {
+		if response := <-cmd.response; response != nil {
+			return resultChan, nil
 		}
 	}
-	result <- ""
-	c.fatal(ECommandFailed)
+	exclusive(&c.jobsLock, func() { delete(c.jobs, jobId) })
 	return
 }
 
-// Set the FreeSWITCH hostname, port, password, and connection timeout manually prior to opening a connection.
-func (c *Client) Configure(hostname string, port int, password string, timeout time.Duration) error {
-	if port <= 0 || port >= 1<<16 {
-		return EInvalidPort
+// Same as Query(), but panics if an error occurs.
+func (c *Client) MustQuery(app string, args ...string) chan string {
+	result, err := c.Query(app, args...)
+	if err != nil {
+		panic(err)
 	}
-	if hostname == "" {
-		return EBlankHostname
-	}
-	c.hostname = hostname
-	c.password = &password
-	c.timeout = timeout
-	c.port = uint16(port)
-
-	return nil
+	return result
 }
 
-func (c *Client) consumeBackgroundJobs() {
-	c.replyLock.Lock()
-	defer c.replyLock.Unlock()
-	if c.replies == nil {
-		c.replies = make(map[string]chan string)
-		c.On("BACKGROUND_JOB", func(e Event) {
-			c.replyLock.Lock()
-			defer c.replyLock.Unlock()
-			if jobId := e.Get("Job-UUID"); jobId != "" {
-				if replyChan := c.replies[jobId]; replyChan != nil {
-					delete(c.replies, jobId)
-					replyChan <- e.Body()
-				}
-			}
+func (c *Client) bgJobDone(e Event) {
+	var (
+		resultChan chan string
+		jobId      = e.Get("Job-UUID")
+	)
+	if jobId != "" {
+		exclusive(&c.jobsLock, func() {
+			resultChan = c.jobs[jobId]
+			delete(c.jobs, jobId)
 		})
+		if resultChan != nil {
+			resultChan <- e.Body()
+		}
 	}
 }
 
-func (c *Client) shutdown() (err error) {
-	if c.conn != nil {
-		err = c.conn.Close()
-		c.conn = nil
+func (c *Client) waitForTicket() error {
+	select {
+	case <-c.tickets:
+		return nil
+	case <-time.After(c.Timeout):
+		return ETimeout
 	}
-	if c.inbox != nil {
-		close(c.inbox)
-		c.inbox = nil
+}
+
+func (c *Client) sendCommand(cmd *command) (sent bool) {
+	cmd.response = make(chan packet, 1)
+	select {
+	case c.outbox <- cmd:
+		return true
+	case <-c.cancel:
+		return false
 	}
-	if c.events != nil {
-		close(c.events)
-		c.events = nil
-	}
-	if c.replies != nil {
-		c.replies = make(map[string]chan string)
+}
+
+func (c *Client) write(cmd ...string) (err error) {
+	joined := strings.Join(cmd, " ")
+	c.log(joined, true)
+	_, err = c.conn.Write(append([]byte(joined), '\n', '\n'))
+	return
+}
+
+func (c *Client) reset() {
+	c.jobs = map[string]chan string{}
+	c.inbox = make(chan *rawPacket)
+	c.errors = make(chan error)
+	c.outbox = make(chan *command)
+	c.cancel = make(chan struct{}, 1)
+	c.reading = make(chan struct{})
+}
+
+func (c *Client) on(name EventName, handler EventHandler) (err error) {
+	c.control.Lock()
+	alreadyHandled := len(c.handlers[name]) > 0
+	c.handlers[name] = append(c.handlers[name], handler)
+	connected := c.conn != nil
+	c.control.Unlock()
+	if connected && !alreadyHandled {
+		cmd := eventsSubscriptionCommand(name)
+		_, err = c.Execute(cmd[0], cmd[1:]...)
 	}
 	return
 }
 
-func (c *Client) fatal(err error) {
-	c.controlLock.Lock()
-	defer c.controlLock.Unlock()
-
-	wasOpen := c.conn != nil
-
-	c.shutdown()
-
-	if h := c.OnDisconnect; h != nil && wasOpen {
-		go h(err)
-	}
-}
-
-func (c *Client) exec(words ...string) (result packet) {
-	if c.conn == nil {
-		panic(ENotConnected) // TODO not this
-	}
-	c.execLock.Lock()
-	defer c.execLock.Unlock()
-	command := strings.Join(words, " ")
-	c.log(command, true)
-	if _, err := c.conn.Write(append([]byte(command), '\n', '\n')); err == nil {
-		result = <-c.inbox
-	} else {
-		c.fatal(err)
-	}
-	return
-}
-
-func (c *Client) log(packet string, isOutbound bool) {
-	if logger := c.Logger; logger != nil {
-		logger(packet, isOutbound)
+func (c *Client) close(err error) {
+	if atomic.CompareAndSwapInt32(&c.running, 1, 0) {
+		c.errors <- err
 	}
 }
 
@@ -275,82 +397,33 @@ func (c *Client) consumePackets() {
 	for {
 		headers, err := mimeReader.ReadMIMEHeader()
 		if err != nil {
-			c.fatal(err)
-			return
+			c.close(err)
+			break
 		}
 		p := &rawPacket{headers: loadHeaders(headers, false)}
 		if contentLengthStr := p.headers.get("Content-Length"); contentLengthStr != "" {
 			contentLength, err := strconv.Atoi(contentLengthStr)
 			if err != nil {
-				c.fatal(err)
-				return
+				c.close(err)
+				break
 			}
 			if contentLength > 0 {
 				body := make([]byte, contentLength)
-				_, err := io.ReadFull(mainReader, body)
-				if err != nil {
-					c.fatal(err)
-					return
+				if _, err := io.ReadFull(mainReader, body); err != nil {
+					c.close(err)
+					break
 				}
 				p.body = string(body)
 			}
 		}
 		c.log(p.String(), false)
-		switch p := p.cast().(type) {
-		case *inboundEvent:
-			if c.events != nil {
-				c.events <- p
-			}
-		case *disconnectNotice:
-			c.fatal(errors.New(p.String()))
-			return
-		default:
-			c.inbox <- p
-		}
+		c.inbox <- p
 	}
+	c.reading <- struct{}{}
 }
 
-func (c *Client) consumeEvents() {
-	if c.events == nil && c.conn != nil && c.handlers != nil {
-		c.events = make(chan Event)
-		if len(c.handlers) > 0 {
-			var (
-				normal []string
-				custom []string
-			)
-			for name, handlers := range c.handlers {
-				if len(handlers) > 0 {
-					if name.IsCustom() {
-						custom = append(custom, name.Subclass)
-					} else {
-						normal = append(normal, name.Name)
-					}
-				}
-			}
-			args := append([]string{"events plain"}, normal...)
-			if len(custom) > 0 {
-				args = append(args, append([]string{"CUSTOM"}, custom...)...)
-			}
-			c.exec(args...)
-		}
-		events := c.events // Avoids a race with the calling function
-		go func() {
-			for event := range events {
-				c.controlLock.Lock()
-				for _, handler := range c.handlers[*event.Name()] {
-					go func(e Event, h EventHandler) {
-						defer func() {
-							if err := recover(); err != nil {
-								if ph := c.OnEventHandlerPanic; ph != nil {
-									ph(e, h, err)
-								}
-							}
-						}()
-						h(e)
-					}(event, handler)
-				}
-				c.controlLock.Unlock()
-			}
-		}()
+func (c *Client) log(packet string, isOutbound bool) {
+	if logger := c.Logger; logger != nil {
+		logger(packet, isOutbound)
 	}
 }

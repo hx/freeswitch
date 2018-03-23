@@ -11,8 +11,9 @@ const (
 	EAuthenticationFailed fsError = "authentication failed"
 	EBlankHostname        fsError = "hostname cannot be blank"
 	ECommandFailed        fsError = "command failed"
-	EInvalidPort          fsError = "port must be between 1 and 65535"
+	EDisconnected         fsError = "host sent disconnection notice"
 	ENotConnected         fsError = "not connected"
+	EShutdown             fsError = "shutdown was requested"
 	ETimeout              fsError = "timeout"
 	EUnexpectedResponse   fsError = "unexpected response from FreeSWITCH"
 )

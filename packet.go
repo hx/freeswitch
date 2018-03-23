@@ -8,7 +8,7 @@ const (
 	ptDisconnectNotice packetType = "text/disconnect-notice"
 	ptResult           packetType = "api/response"
 	ptEventPlain       packetType = "text/event-plain"
-	ptEventJSON        packetType = "text/event-json"
+	ptEventJSON        packetType = "text/event-json" // Unused
 )
 
 type rawPacket struct {
