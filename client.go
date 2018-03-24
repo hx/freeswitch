@@ -186,7 +186,7 @@ func (c *Client) Connect() (err error) {
 							}(p, handler)
 						}
 					case *disconnectNotice:
-						go c.close(EDisconnected) // This may be ignored if the socket closes before this error reaches the loop
+						err = EDisconnected
 					default:
 						if len(commandFifo) > 0 {
 							cmd := commandFifo[0]
@@ -202,9 +202,16 @@ func (c *Client) Connect() (err error) {
 				case c.outbox <- cmdChan:
 					outbound := <-cmdChan
 					commandFifo = append(commandFifo, outbound)
-					if err := c.write(outbound.command...); err != nil {
-						go c.close(err)
-					}
+					err = c.write(outbound.command...)
+				}
+			}
+
+			// If the loop set an error, there may also be an error trying to get into the error channel
+			if !atomic.CompareAndSwapInt32(&c.running, 1, 0) {
+
+				// The only error from this channel that should be preferred over one from the loop is an EShutdown
+				if <-c.errors == EShutdown {
+					err = EShutdown
 				}
 			}
 
