@@ -180,10 +180,7 @@ func (c *Client) Connect() (err error) {
 							handlers = c.handlers[*p.Name()][:]
 						})
 						for _, handler := range handlers {
-							go func(e Event, h EventHandler) {
-								// TODO: recover from panics
-								h(e)
-							}(p, handler)
+							go handler(p) // Rely on handlers to recover from their own panics
 						}
 					case *disconnectNotice:
 						err = EDisconnected
@@ -192,9 +189,8 @@ func (c *Client) Connect() (err error) {
 							cmd := commandFifo[0]
 							commandFifo = commandFifo[1:]
 							cmd.response <- p
-						} else {
-							// TODO what to do with discarded packets?
 						}
+						// Discard other packets
 					}
 
 				// A goroutine wants to write to the connection. During connection and handshake, it'll block until
