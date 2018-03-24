@@ -44,16 +44,14 @@ type Client struct {
 
 	conn     net.Conn
 	inbox    chan *rawPacket
-	outbox   chan *command
+	outbox   chan chan *command
 	errors   chan error
 	reading  chan struct{}
 	running  int32
 	handlers map[EventName][]EventHandler
 	control  sync.Mutex
-	cancel   chan struct{}
 	jobs     map[string]chan string // use jobsJock when reading/writing
 	jobsLock sync.Mutex
-	tickets  chan struct{}
 }
 
 // A function that can be registered to handle events.
@@ -73,7 +71,7 @@ func NewClient() (c *Client) {
 		Port:     defaultPort,
 		Timeout:  defaultTimeout,
 
-		tickets:  make(chan struct{}),
+		outbox:   make(chan chan *command),
 		handlers: map[EventName][]EventHandler{{"BACKGROUND_JOB", ""}: {c.bgJobDone}},
 	}
 	c.guessConfiguration()
@@ -167,11 +165,8 @@ func (c *Client) Connect() (err error) {
 
 			// This is the normal operation loop
 			for err == nil {
+				cmdChan := make(chan *command)
 				select {
-
-				// A goroutine wants to write to the connection. During connection and handshake, it'll block until
-				// it gets one of these.
-				case c.tickets <- struct{}{}:
 
 				// This will break the loop
 				case err = <-c.errors:
@@ -202,13 +197,14 @@ func (c *Client) Connect() (err error) {
 						}
 					}
 
-				// We need to send a packet to freeswitch
-				case outbound := <-c.outbox:
+				// A goroutine wants to write to the connection. During connection and handshake, it'll block until
+				// it gets one of these.
+				case c.outbox <- cmdChan:
+					outbound := <-cmdChan
 					commandFifo = append(commandFifo, outbound)
-					if err = c.write(outbound.command...); err != nil {
+					if err := c.write(outbound.command...); err != nil {
 						go c.close(err)
 					}
-
 				}
 			}
 
@@ -220,10 +216,6 @@ func (c *Client) Connect() (err error) {
 				cmd.response <- nil
 			}
 		}
-
-		// If something is waiting to send a command to the outbox, give it the bad news. There should only be one,
-		// because only one ticket should be issued per loop cycle.
-		c.cancel <- struct{}{}
 
 		// Close the connection
 		c.conn.Close()
@@ -264,12 +256,16 @@ func (c *Client) OnCustom(eventSubclass string, handler EventHandler) {
 // This is a blocking (synchronous) method. If you want to discard the result, or execute a call asynchronously, use
 // Query().
 func (c *Client) Execute(app string, args ...string) (result string, err error) {
-	if err = c.waitForTicket(); err != nil {
-		return
-	}
-	err = ENotConnected
-	cmd := &command{command: append([]string{"api", app}, args...)}
-	if c.sendCommand(cmd) {
+	return c.execute(append([]string{"api", app}, args...))
+}
+
+func (c *Client) execute(args []string) (result string, err error) {
+	var ch chan *command
+	ch, err = c.startCommand()
+	if err == nil {
+		err = ENotConnected
+		cmd := newCommand(args)
+		ch <- cmd
 		if response := <-cmd.response; response != nil {
 			return response.String(), nil
 		}
@@ -289,22 +285,20 @@ func (c *Client) MustExecute(app string, args ...string) string {
 // Run an API command, and get the response as a string through the returned channel.
 //
 // See Execute(). This method is identical, but returns a channel through which the result will eventually be passed.
-func (c *Client) Query(app string, args ...string) (ch chan string, err error) {
-	if err = c.waitForTicket(); err != nil {
-		return
-	}
-	var (
-		jobId      = uniqId()
-		cmd        = &command{command: append([]string{"bgapi", app}, args...)}
-		resultChan = make(chan string, 1)
-	)
-	cmd.command[(len(cmd.command) - 1)] += "\nJob-UUID: " + jobId
-	exclusive(&c.jobsLock, func() { c.jobs[jobId] = resultChan })
-	err = ENotConnected
-	if c.sendCommand(cmd) {
+func (c *Client) Query(app string, args ...string) (result chan string, err error) {
+	var ch chan *command
+	ch, err = c.startCommand()
+	jobId := uniqId()
+	if err == nil {
+		err = ENotConnected
+		cmd := newCommand(append([]string{"bgapi", app}, args...))
+		cmd.command[(len(cmd.command) - 1)] += "\nJob-UUID: " + jobId
+		exclusive(&c.jobsLock, func() { c.jobs[jobId] = result })
+		ch <- cmd
 		if response := <-cmd.response; response != nil {
-			return resultChan, nil
+			return result, nil
 		}
+		result = nil
 	}
 	exclusive(&c.jobsLock, func() { delete(c.jobs, jobId) })
 	return
@@ -335,23 +329,13 @@ func (c *Client) bgJobDone(e Event) {
 	}
 }
 
-func (c *Client) waitForTicket() error {
+func (c *Client) startCommand() (ch chan *command, err error) {
 	select {
-	case <-c.tickets:
-		return nil
+	case ch = <-c.outbox:
 	case <-time.After(c.Timeout):
-		return ETimeout
+		err = ETimeout
 	}
-}
-
-func (c *Client) sendCommand(cmd *command) (sent bool) {
-	cmd.response = make(chan packet, 1)
-	select {
-	case c.outbox <- cmd:
-		return true
-	case <-c.cancel:
-		return false
-	}
+	return
 }
 
 func (c *Client) write(cmd ...string) (err error) {
@@ -365,8 +349,6 @@ func (c *Client) reset() {
 	c.jobs = map[string]chan string{}
 	c.inbox = make(chan *rawPacket)
 	c.errors = make(chan error)
-	c.outbox = make(chan *command)
-	c.cancel = make(chan struct{}, 1)
 	c.reading = make(chan struct{})
 }
 
@@ -377,8 +359,7 @@ func (c *Client) on(name EventName, handler EventHandler) (err error) {
 	connected := c.conn != nil
 	c.control.Unlock()
 	if connected && !alreadyHandled {
-		cmd := eventsSubscriptionCommand(name)
-		_, err = c.Execute(cmd[0], cmd[1:]...)
+		_, err = c.execute(eventsSubscriptionCommand(name))
 	}
 	return
 }
