@@ -1,4 +1,4 @@
-// This package provides a control interface into FreeSWITCH over its event socket layer.
+// Package freeswitch provides a control interface into FreeSWITCH over its event socket layer.
 //
 // You can run API commands as you would in the CLI, and listen for events.
 //
@@ -25,7 +25,7 @@ const (
 	defaultTimeout         = 5 * time.Second
 )
 
-// Represents a connection to FreeSWITCH's event socket layer. A zero Client is not valid; use NewClient().
+// Client represents a connection to FreeSWITCH's event socket layer. A zero Client is not valid; use NewClient().
 type Client struct {
 	// The hostname or IP address to which the client should connect (default "localhost").
 	Hostname string
@@ -59,7 +59,7 @@ type Client struct {
 	jobsLock sync.Mutex
 }
 
-// A function that can be registered to handle events.
+// EventHandler is a function that can be registered to handle events.
 type EventHandler func(Event)
 
 type command struct {
@@ -67,7 +67,7 @@ type command struct {
 	response chan packet
 }
 
-// Make a new client with the default hostname, password, port, and timeout. Client will attempt to read
+// NewClient makes a new client with the default hostname, password, port, and timeout. It will attempt to read
 // FreeSWITCH's event socket configuration file to obtain connection details.
 func NewClient() (c *Client) {
 	c = &Client{
@@ -244,7 +244,7 @@ func (c *Client) Connect() (err error) {
 	return
 }
 
-// Close the connection to FreeSWITCH and return from Connect().
+// Shutdown will close the connection to FreeSWITCH and return from Connect().
 func (c *Client) Shutdown() {
 	c.control.Lock()
 	defer c.control.Unlock()
@@ -300,16 +300,16 @@ func (c *Client) MustExecute(app string, args ...string) string {
 // See Execute(). This method is identical, but returns a channel through which the result will eventually be passed.
 func (c *Client) Query(app string, args ...string) (result chan string, err error) {
 	var (
-		jobId = uniqId()
-		cmd   = app + " " + strings.Join(args, " ") + "\nJob-UUID: " + jobId
+		jobID = uniqueID()
+		cmd   = app + " " + strings.Join(args, " ") + "\nJob-UUID: " + jobID
 		p     packet
 	)
 	result = make(chan string, 1)
-	exclusive(&c.jobsLock, func() { c.jobs[jobId] = result })
+	exclusive(&c.jobsLock, func() { c.jobs[jobID] = result })
 	p, err = c.execute([]string{"bgapi", cmd})
 	if p == nil {
 		result = nil
-		exclusive(&c.jobsLock, func() { delete(c.jobs, jobId) })
+		exclusive(&c.jobsLock, func() { delete(c.jobs, jobID) })
 	}
 	return
 }
@@ -345,12 +345,12 @@ func (c *Client) execute(args []string) (result packet, err error) {
 func (c *Client) bgJobDone(e Event) {
 	var (
 		resultChan chan string
-		jobId      = e.Get("Job-UUID")
+		jobID      = e.Get("Job-UUID")
 	)
-	if jobId != "" {
+	if jobID != "" {
 		exclusive(&c.jobsLock, func() {
-			resultChan = c.jobs[jobId]
-			delete(c.jobs, jobId)
+			resultChan = c.jobs[jobID]
+			delete(c.jobs, jobID)
 		})
 		if resultChan != nil {
 			resultChan <- e.Body()

@@ -46,9 +46,8 @@ func (en *EventName) IsCustom() bool {
 func (en *EventName) String() string {
 	if en.IsCustom() {
 		return en.Name + " " + en.Subclass
-	} else {
-		return en.Name
 	}
+	return en.Name
 }
 
 func (ie *inboundEvent) Name() *EventName {

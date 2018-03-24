@@ -22,7 +22,7 @@ func (r *reply) String() string {
 	return r.headers.get("Reply-Text")
 }
 
-func (r *reply) jobId() (uuid string) {
+func (r *reply) jobID() (uuid string) {
 	return r.headers.get("Job-UUID")
 }
 

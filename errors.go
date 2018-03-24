@@ -6,6 +6,7 @@ func (e fsError) Error() string {
 	return string(e)
 }
 
+// These errors, amongst others, may be returned by a failing or closing client connection.
 const (
 	EAlreadyConnected     fsError = "already connected"
 	EAuthenticationFailed fsError = "authentication failed"

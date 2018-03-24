@@ -11,15 +11,15 @@ func exclusive(lock sync.Locker, f func()) {
 	f()
 }
 
-const uniqIdPool = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+const uniqueIDPool = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
 
-func uniqId() string {
+func uniqueID() string {
 	var (
-		n      = int32(len(uniqIdPool))
+		n      = int32(len(uniqueIDPool))
 		result = make([]byte, 32)
 	)
 	for i := range result {
-		result[i] = uniqIdPool[rand.Int31n(n)]
+		result[i] = uniqueIDPool[rand.Int31n(n)]
 	}
 	return string(result)
 }
