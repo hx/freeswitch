@@ -47,10 +47,3 @@ func eventsSubscriptionCommand(eventNames ...EventName) (cmd []string) {
 	}
 	return
 }
-
-func newCommand(args []string) *command {
-	return &command{
-		command:  args,
-		response: make(chan packet),
-	}
-}

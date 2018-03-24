@@ -260,18 +260,26 @@ func (c *Client) OnCustom(eventSubclass string, handler EventHandler) {
 // This is a blocking (synchronous) method. If you want to discard the result, or execute a call asynchronously, use
 // Query().
 func (c *Client) Execute(app string, args ...string) (result string, err error) {
-	return c.execute(append([]string{"api", app}, args...))
+	var p packet
+	p, err = c.execute(append([]string{"api", app}, args...))
+	if p != nil {
+		result = p.String()
+	}
+	return
 }
 
-func (c *Client) execute(args []string) (result string, err error) {
+func (c *Client) execute(args []string) (result packet, err error) {
 	var ch chan *command
 	ch, err = c.startCommand()
 	if err == nil {
 		err = ENotConnected
-		cmd := newCommand(args)
+		cmd := &command{
+			command:  args,
+			response: make(chan packet),
+		}
 		ch <- cmd
 		if response := <-cmd.response; response != nil {
-			return response.String(), nil
+			return response, nil
 		}
 	}
 	return
@@ -290,22 +298,18 @@ func (c *Client) MustExecute(app string, args ...string) string {
 //
 // See Execute(). This method is identical, but returns a channel through which the result will eventually be passed.
 func (c *Client) Query(app string, args ...string) (result chan string, err error) {
-	var ch chan *command
-	ch, err = c.startCommand()
-	jobId := uniqId()
-	if err == nil {
-		err = ENotConnected
-		cmd := newCommand(append([]string{"bgapi", app}, args...))
-		cmd.command[(len(cmd.command) - 1)] += "\nJob-UUID: " + jobId
-		result = make(chan string, 1)
-		exclusive(&c.jobsLock, func() { c.jobs[jobId] = result })
-		ch <- cmd
-		if response := <-cmd.response; response != nil {
-			return result, nil
-		}
+	var (
+		jobId = uniqId()
+		cmd   = app + " " + strings.Join(args, " ") + "\nJob-UUID: " + jobId
+		p     packet
+	)
+	result = make(chan string, 1)
+	exclusive(&c.jobsLock, func() { c.jobs[jobId] = result })
+	p, err = c.execute([]string{"bgapi", cmd})
+	if p == nil {
 		result = nil
+		exclusive(&c.jobsLock, func() { delete(c.jobs, jobId) })
 	}
-	exclusive(&c.jobsLock, func() { delete(c.jobs, jobId) })
 	return
 }
 
