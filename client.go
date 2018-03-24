@@ -72,8 +72,9 @@ func NewClient() (c *Client) {
 		Timeout:  defaultTimeout,
 
 		outbox:   make(chan chan *command),
-		handlers: map[EventName][]EventHandler{{"BACKGROUND_JOB", ""}: {c.bgJobDone}},
+		handlers: map[EventName][]EventHandler{},
 	}
+	c.handlers[EventName{"BACKGROUND_JOB", ""}] = []EventHandler{c.bgJobDone}
 	c.guessConfiguration()
 	return
 }
@@ -296,6 +297,7 @@ func (c *Client) Query(app string, args ...string) (result chan string, err erro
 		err = ENotConnected
 		cmd := newCommand(append([]string{"bgapi", app}, args...))
 		cmd.command[(len(cmd.command) - 1)] += "\nJob-UUID: " + jobId
+		result = make(chan string, 1)
 		exclusive(&c.jobsLock, func() { c.jobs[jobId] = result })
 		ch <- cmd
 		if response := <-cmd.response; response != nil {
