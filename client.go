@@ -39,8 +39,13 @@ type Client struct {
 	// Timeout to use for connection and then for authentication (default 5 seconds).
 	Timeout time.Duration
 
-	//Optional. Called when sending and receiving data to/from FreeSWITCH.
+	// Optional. Called when sending and receiving data to/from FreeSWITCH.
 	Logger func(packet string, isOutbound bool)
+
+	// Advanced. If true, only "bgapi" commands will be used. This will not affect the client's behaviour, but
+	// may affect performance of FreeSWITCH (for better or worse). If in doubt, leave it false. To avoid races,
+	// don't change its value while connected.
+	PreventSocketBlocking bool
 
 	conn     net.Conn
 	inbox    chan *rawPacket
@@ -262,11 +267,21 @@ func (c *Client) OnCustom(eventSubclass string, handler EventHandler) {
 //
 // This is a blocking (synchronous) method. If you want to discard the result, or execute a call asynchronously, use
 // Query().
+//
+// Internally, this method uses the "api" command. If PreventSocketBlocking is true, it will use "bgapi" instead, and
+// block until a response is received. Either way, its behaviour should be the same.
 func (c *Client) Execute(app string, args ...string) (result string, err error) {
-	var p packet
-	p, err = c.execute(append([]string{"api", app}, args...))
-	if p != nil {
-		result = p.String()
+	if c.PreventSocketBlocking {
+		ch, err := c.Query(app, args...)
+		if err == nil {
+			result = <-ch
+		}
+	} else {
+		var p packet
+		p, err = c.execute(append([]string{"api", app}, args...))
+		if p != nil {
+			result = p.String()
+		}
 	}
 	return
 }
