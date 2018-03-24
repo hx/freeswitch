@@ -155,7 +155,7 @@ func (c *Client) Connect() (err error) {
 		if err == nil {
 
 			// Commands will wait in this queue to receive their responses
-			var commandFifo []*command
+			var cmdFiFo []*command
 
 			// Allow other goroutines to put the client into an error state
 			atomic.StoreInt32(&c.running, 1)
@@ -185,9 +185,9 @@ func (c *Client) Connect() (err error) {
 					case *disconnectNotice:
 						err = EDisconnected
 					default:
-						if len(commandFifo) > 0 {
-							cmd := commandFifo[0]
-							commandFifo = commandFifo[1:]
+						if len(cmdFiFo) > 0 {
+							cmd := cmdFiFo[0]
+							cmdFiFo = cmdFiFo[1:]
 							cmd.response <- p
 						}
 						// Discard other packets
@@ -196,9 +196,9 @@ func (c *Client) Connect() (err error) {
 				// A goroutine wants to write to the connection. During connection and handshake, it'll block until
 				// it gets one of these.
 				case c.outbox <- cmdChan:
-					outbound := <-cmdChan
-					commandFifo = append(commandFifo, outbound)
-					err = c.write(outbound.command...)
+					cmd := <-cmdChan
+					cmdFiFo = append(cmdFiFo, cmd)
+					err = c.write(cmd.command...)
 				}
 			}
 
@@ -215,7 +215,7 @@ func (c *Client) Connect() (err error) {
 			c.control.Lock()
 
 			// Cancel pending commands that haven't yet received their responses
-			for _, cmd := range commandFifo {
+			for _, cmd := range cmdFiFo {
 				cmd.response <- nil
 			}
 		}
