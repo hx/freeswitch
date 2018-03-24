@@ -95,8 +95,11 @@ func (c *Client) Connect() (err error) {
 		return EBlankHostname
 	}
 
-	// Set up maps and channels
-	c.reset()
+	// Set up maps and channels that may be left dirty after a previous connection TODO: reassess
+	c.jobs = map[string]chan string{}
+	c.inbox = make(chan *rawPacket)
+	c.errors = make(chan error)
+	c.reading = make(chan struct{})
 
 	// Attempt TCP connection to FreeSWITCH
 	if c.conn, err = net.DialTimeout("tcp", c.Hostname+":"+strconv.Itoa(int(c.Port)), c.Timeout); err == nil {
@@ -268,23 +271,6 @@ func (c *Client) Execute(app string, args ...string) (result string, err error) 
 	return
 }
 
-func (c *Client) execute(args []string) (result packet, err error) {
-	var ch chan *command
-	ch, err = c.startCommand()
-	if err == nil {
-		err = ENotConnected
-		cmd := &command{
-			command:  args,
-			response: make(chan packet),
-		}
-		ch <- cmd
-		if response := <-cmd.response; response != nil {
-			return response, nil
-		}
-	}
-	return
-}
-
 // Same as Execute(), but panics if an error occurs.
 func (c *Client) MustExecute(app string, args ...string) string {
 	result, err := c.Execute(app, args...)
@@ -322,6 +308,25 @@ func (c *Client) MustQuery(app string, args ...string) chan string {
 	return result
 }
 
+func (c *Client) execute(args []string) (result packet, err error) {
+	var ch chan *command
+	select {
+	case ch = <-c.outbox:
+	case <-time.After(c.Timeout):
+		return nil, ETimeout
+	}
+	cmd := &command{
+		command:  args,
+		response: make(chan packet),
+	}
+	ch <- cmd
+	result = <-cmd.response
+	if result == nil {
+		err = ENotConnected
+	}
+	return
+}
+
 func (c *Client) bgJobDone(e Event) {
 	var (
 		resultChan chan string
@@ -338,27 +343,11 @@ func (c *Client) bgJobDone(e Event) {
 	}
 }
 
-func (c *Client) startCommand() (ch chan *command, err error) {
-	select {
-	case ch = <-c.outbox:
-	case <-time.After(c.Timeout):
-		err = ETimeout
-	}
-	return
-}
-
 func (c *Client) write(cmd ...string) (err error) {
 	joined := strings.Join(cmd, " ")
 	c.log(joined, true)
 	_, err = c.conn.Write(append([]byte(joined), '\n', '\n'))
 	return
-}
-
-func (c *Client) reset() {
-	c.jobs = map[string]chan string{}
-	c.inbox = make(chan *rawPacket)
-	c.errors = make(chan error)
-	c.reading = make(chan struct{})
 }
 
 func (c *Client) on(name EventName, handler EventHandler) (err error) {
