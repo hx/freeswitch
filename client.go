@@ -223,6 +223,16 @@ func (c *Client) Connect() (err error) {
 					c.jobs = map[string]chan string{}
 				}
 			})
+
+			// Tell goroutines waiting to send commands that we're closed for the day
+			for done := false; !done; {
+				select {
+				case ch := <-c.outbox:
+					ch <- nil
+				default:
+					done = true
+				}
+			}
 		}
 
 		// If the loop set an error, there may also be an error trying to get into the error channel
@@ -332,19 +342,23 @@ func (c *Client) MustQuery(app string, args ...string) chan string {
 func (c *Client) execute(args []string) (result packet, err error) {
 	var ch chan *command
 	select {
-	// TODO: add another channel for a connection-closing event, to rely less on timeout.
 	case ch = <-c.outbox:
+		if ch == nil {
+			err = ENotConnected
+		}
 	case <-time.After(c.Timeout):
-		return nil, ETimeout
+		err = ETimeout
 	}
-	cmd := &command{
-		command:  args,
-		response: make(chan packet),
-	}
-	ch <- cmd
-	result = <-cmd.response
-	if result == nil {
-		err = ENotConnected
+	if err == nil {
+		cmd := &command{
+			command:  args,
+			response: make(chan packet),
+		}
+		ch <- cmd
+		result = <-cmd.response
+		if result == nil {
+			err = ENotConnected
+		}
 	}
 	return
 }
