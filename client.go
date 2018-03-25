@@ -69,19 +69,23 @@ type command struct {
 
 // NewClient makes a new client with the default hostname, password, port, and timeout. It will attempt to read
 // FreeSWITCH's event socket configuration file to obtain connection details.
-func NewClient() (c *Client) {
-	c = &Client{
+func NewClient() *Client {
+	c := &Client{
 		Hostname: defaultHostname,
 		Password: defaultPassword,
 		Port:     defaultPort,
 		Timeout:  defaultTimeout,
 
+		inbox:    make(chan *rawPacket),
 		outbox:   make(chan chan *command),
 		handlers: map[EventName][]EventHandler{},
+		jobs:     map[string]chan string{},
+		errors:   make(chan error),
+		reading:  make(chan struct{}),
 	}
 	c.handlers[EventName{"BACKGROUND_JOB", ""}] = []EventHandler{c.bgJobDone}
 	c.guessConfiguration()
-	return
+	return c
 }
 
 // Connect to FreeSWITCH and block until disconnection. Call this method in its own goroutine, and call Shutdown()
@@ -91,7 +95,7 @@ func (c *Client) Connect() (err error) {
 	defer c.control.Unlock()
 
 	// Make sure we're not already connected.
-	if c.conn != nil {
+	if !c.setRunning(true) {
 		return EAlreadyConnected
 	}
 
@@ -100,18 +104,12 @@ func (c *Client) Connect() (err error) {
 		return EBlankHostname
 	}
 
-	// Set up maps and channels that may be left dirty after a previous connection TODO: reassess
-	c.jobs = map[string]chan string{}
-	c.inbox = make(chan *rawPacket)
-	c.errors = make(chan error)
-	c.reading = make(chan struct{})
-
 	// Attempt TCP connection to FreeSWITCH
 	if c.conn, err = net.DialTimeout("tcp", c.Hostname+":"+strconv.Itoa(int(c.Port)), c.Timeout); err == nil {
 
 		// Start reading packets from FS and pumping them into the inbox channel. This process can be interrupted
 		// by closing the connection, then waiting on the `reading` channel for it to exit.
-		go c.consumePackets()
+		go c.read()
 
 		// This timeout will cover authentication and event subscription
 		handshakeTimeout := time.After(c.Timeout)
@@ -166,9 +164,6 @@ func (c *Client) Connect() (err error) {
 			// Commands will wait in this queue to receive their responses
 			var cmdFiFo []*command
 
-			// Allow other goroutines to put the client into an error state
-			atomic.StoreInt32(&c.running, 1)
-
 			// Allow other goroutines to take control of the client
 			c.control.Unlock()
 
@@ -211,15 +206,6 @@ func (c *Client) Connect() (err error) {
 				}
 			}
 
-			// If the loop set an error, there may also be an error trying to get into the error channel
-			if !atomic.CompareAndSwapInt32(&c.running, 1, 0) {
-
-				// The only error from this channel that should be preferred over one from the loop is an EShutdown
-				if <-c.errors == EShutdown {
-					err = EShutdown
-				}
-			}
-
 			// Take control back from other goroutines
 			c.control.Lock()
 
@@ -227,14 +213,34 @@ func (c *Client) Connect() (err error) {
 			for _, cmd := range cmdFiFo {
 				cmd.response <- nil
 			}
+
+			// Unblock background jobs with empty responses
+			exclusive(&c.jobsLock, func() {
+				if len(c.jobs) > 0 {
+					for _, job := range c.jobs {
+						job <- ""
+					}
+					c.jobs = map[string]chan string{}
+				}
+			})
+		}
+
+		// If the loop set an error, there may also be an error trying to get into the error channel
+		if !c.setRunning(false) {
+
+			// The only error from this channel that should be preferred over one from the loop is an EShutdown
+			if <-c.errors == EShutdown {
+				err = EShutdown
+			}
 		}
 
 		// Close the connection
 		c.conn.Close()
-		c.conn = nil
 
-		// Wait for the consumePackets() goroutine to finish
+		// Wait for the read() goroutine to finish
 		<-c.reading
+	} else {
+		c.setRunning(false)
 	}
 
 	// Normalise the exit error.
@@ -246,8 +252,6 @@ func (c *Client) Connect() (err error) {
 
 // Shutdown will close the connection to FreeSWITCH and return from Connect().
 func (c *Client) Shutdown() {
-	c.control.Lock()
-	defer c.control.Unlock()
 	c.close(EShutdown)
 	// No need to block here. Another connection attempt will wait for the control lock.
 }
@@ -298,6 +302,8 @@ func (c *Client) MustExecute(app string, args ...string) string {
 // Run an API command, and get the response as a string through the returned channel.
 //
 // See Execute(). This method is identical, but returns a channel through which the result will eventually be passed.
+// If the connection is interrupted or the command results in an error, an empty string will be sent through the
+// returned channel.
 func (c *Client) Query(app string, args ...string) (result chan string, err error) {
 	var (
 		jobID = uniqueID()
@@ -326,6 +332,7 @@ func (c *Client) MustQuery(app string, args ...string) chan string {
 func (c *Client) execute(args []string) (result packet, err error) {
 	var ch chan *command
 	select {
+	// TODO: add another channel for a connection-closing event, to rely less on timeout.
 	case ch = <-c.outbox:
 	case <-time.After(c.Timeout):
 		return nil, ETimeout
@@ -369,50 +376,55 @@ func (c *Client) on(name EventName, handler EventHandler) (err error) {
 	c.control.Lock()
 	alreadyHandled := len(c.handlers[name]) > 0
 	c.handlers[name] = append(c.handlers[name], handler)
-	connected := c.conn != nil
 	c.control.Unlock()
-	if connected && !alreadyHandled {
+	if c.isRunning() && !alreadyHandled {
 		_, err = c.execute(eventsSubscriptionCommand(name))
 	}
 	return
 }
 
 func (c *Client) close(err error) {
-	if atomic.CompareAndSwapInt32(&c.running, 1, 0) {
+	if c.setRunning(false) {
 		c.errors <- err
 	}
 }
 
-func (c *Client) consumePackets() {
-	var (
-		mainReader = bufio.NewReader(c.conn)
-		mimeReader = textproto.NewReader(mainReader)
-	)
-	for {
-		headers, err := mimeReader.ReadMIMEHeader()
-		if err != nil {
-			c.close(err)
-			break
-		}
-		p := &rawPacket{headers: loadHeaders(headers, false)}
-		if contentLengthStr := p.headers.get("Content-Length"); contentLengthStr != "" {
-			contentLength, err := strconv.Atoi(contentLengthStr)
-			if err != nil {
-				c.close(err)
-				break
-			}
-			if contentLength > 0 {
-				body := make([]byte, contentLength)
-				if _, err := io.ReadFull(mainReader, body); err != nil {
-					c.close(err)
-					break
-				}
-				p.body = string(body)
-			}
-		}
-		c.log(p.String(), false)
-		c.inbox <- p
+func (c *Client) setRunning(running bool) (changed bool) {
+	var old int32
+	if !running {
+		old = 1
 	}
+	return atomic.CompareAndSwapInt32(&c.running, old, 1-old)
+}
+
+func (c *Client) isRunning() bool {
+	return atomic.LoadInt32(&c.running) == 1
+}
+
+func (c *Client) read() {
+	var (
+		mainReader    = bufio.NewReader(c.conn)
+		mimeReader    = textproto.NewReader(mainReader)
+		err           error
+		headers       textproto.MIMEHeader
+		contentLength int
+	)
+	for err == nil {
+		if headers, err = mimeReader.ReadMIMEHeader(); err == nil {
+			p := &rawPacket{headers: loadHeaders(headers, false)}
+			if contentLengthStr := p.headers.get("Content-Length"); contentLengthStr != "" {
+				if contentLength, err = strconv.Atoi(contentLengthStr); err == nil && contentLength > 0 {
+					body := make([]byte, contentLength)
+					if _, err = io.ReadFull(mainReader, body); err == nil {
+						p.body = string(body)
+					}
+				}
+			}
+			c.log(p.String(), false)
+			c.inbox <- p
+		}
+	}
+	c.close(err)
 	c.reading <- struct{}{}
 }
 
