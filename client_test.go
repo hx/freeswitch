@@ -51,3 +51,26 @@ func ExampleNewClient_persistent() {
 	// Output: Disconnected: EOF; trying again in 5 seconds
 	// Termination was graceful.
 }
+
+// This example shows waiting for connection to succeed before attempting to run a command.
+//
+// Because Connect() blocks until disconnection, intended or otherwise, there's no clear indication that
+// connection and handshaking has completed. However, Execute() blocks until the client is ready to send commands,
+// so a simple no-op can guide your way.
+func ExampleClient_Execute() {
+	// Make a new client, guessing its configuration
+	c := freeswitch.NewClient()
+
+	// Open a connection, with no regard to how it terminates
+	go c.Connect()
+
+	// A successful execution means connection has succeeded
+	if _, err := c.Execute("status"); err != nil {
+		panic(err)
+	}
+
+	// We can now assume we are connected, and go about our business
+	fmt.Println(c.Execute("reloadxml"))
+	c.Shutdown()
+	// Output: +OK [Success]
+}

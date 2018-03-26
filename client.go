@@ -36,7 +36,8 @@ type Client struct {
 	// The FreeSWITCH event socket password (default "ClueCon").
 	Password string
 
-	// Timeout to use for connection and then for authentication (default 5 seconds).
+	// Timeout to use for connection and then for authentication (default 5 seconds), and also for commands to be
+	// accepted.
 	Timeout time.Duration
 
 	// Optional. Called when sending and receiving data to/from FreeSWITCH.
@@ -47,9 +48,16 @@ type Client struct {
 	// don't change its value while connected.
 	PreventSocketBlocking bool
 
+	// When false, commands that are interrupted by a disconnection will continue waiting until Timeout is reached,
+	// or until the client re-connects and the command is accepted. When true, disconnection will cause immediate
+	// command failure. Only commands interrupted by disconnection are affected; commands attempted while disconnected
+	// will wait up to Timeout for (re-)connection. If you are running Connect() in a retry loop, leave this false.
+	// See Execute().
+	FailOnDisconnect bool
+
 	conn     net.Conn
 	inbox    chan *rawPacket
-	outbox   chan chan *command
+	outbox   chan *command
 	errors   chan error
 	reading  chan struct{}
 	running  int32
@@ -77,13 +85,13 @@ func NewClient() *Client {
 		Timeout:  defaultTimeout,
 
 		inbox:    make(chan *rawPacket),
-		outbox:   make(chan chan *command),
+		outbox:   make(chan *command),
 		handlers: map[EventName][]EventHandler{},
 		jobs:     map[string]chan string{},
 		errors:   make(chan error),
 		reading:  make(chan struct{}),
 	}
-	c.handlers[EventName{"BACKGROUND_JOB", ""}] = []EventHandler{c.bgJobDone}
+	c.handlers[EventName{"BACKGROUND_JOB", ""}] = []EventHandler{c.bgJobDone} // TODO: this, but only when needed
 	c.guessConfiguration()
 	return c
 }
@@ -103,6 +111,9 @@ func (c *Client) Connect() (err error) {
 	if c.Hostname == "" {
 		return EBlankHostname
 	}
+
+	// Flag set by loop when receiving an error through the errors channel, to avoid an extra read
+	var receivedError bool
 
 	// Attempt TCP connection to FreeSWITCH
 	if c.conn, err = net.DialTimeout("tcp", c.Hostname+":"+strconv.Itoa(int(c.Port)), c.Timeout); err == nil {
@@ -169,11 +180,11 @@ func (c *Client) Connect() (err error) {
 
 			// This is the normal operation loop
 			for err == nil {
-				cmdChan := make(chan *command)
 				select {
 
 				// This will break the loop
 				case err = <-c.errors:
+					receivedError = true
 
 				// We've received an inbound packet from FreeSWITCH
 				case inbound := <-c.inbox:
@@ -197,10 +208,9 @@ func (c *Client) Connect() (err error) {
 						// Discard other packets
 					}
 
-				// A goroutine wants to write to the connection. During connection and handshake, it'll block until
-				// it gets one of these.
-				case c.outbox <- cmdChan:
-					cmd := <-cmdChan
+				// Commands will be sent by Execute(), Query() etc to this channel. During connection and handshake,
+				// they'll block until here.
+				case cmd := <-c.outbox:
 					cmdFiFo = append(cmdFiFo, cmd)
 					err = c.write(cmd.command...)
 				}
@@ -208,11 +218,6 @@ func (c *Client) Connect() (err error) {
 
 			// Take control back from other goroutines
 			c.control.Lock()
-
-			// Cancel pending commands that haven't yet received their responses
-			for _, cmd := range cmdFiFo {
-				cmd.response <- nil
-			}
 
 			// Unblock background jobs with empty responses
 			exclusive(&c.jobsLock, func() {
@@ -225,22 +230,20 @@ func (c *Client) Connect() (err error) {
 			})
 
 			// Tell goroutines waiting to send commands that we're closed for the day
-			for done := false; !done; {
-				select {
-				case ch := <-c.outbox:
-					ch <- nil
-				default:
-					done = true
+			if c.FailOnDisconnect {
+				for done := false; !done; {
+					select {
+					case cmd := <-c.outbox:
+						cmd.response <- nil
+					default:
+						done = true
+					}
 				}
 			}
-		}
 
-		// If the loop set an error, there may also be an error trying to get into the error channel
-		if !c.setRunning(false) {
-
-			// The only error from this channel that should be preferred over one from the loop is an EShutdown
-			if <-c.errors == EShutdown {
-				err = EShutdown
+			// Cancel pending commands that haven't yet received their responses
+			for _, cmd := range cmdFiFo {
+				cmd.response <- nil
 			}
 		}
 
@@ -249,8 +252,15 @@ func (c *Client) Connect() (err error) {
 
 		// Wait for the read() goroutine to finish
 		<-c.reading
-	} else {
-		c.setRunning(false)
+	}
+
+	// There may also be an error trying to get into the error channel
+	if !c.setRunning(false) && !receivedError {
+
+		// The only error from this channel that should be preferred over one from this method is an EShutdown
+		if <-c.errors == EShutdown {
+			err = EShutdown
+		}
 	}
 
 	// Normalise the exit error.
@@ -277,10 +287,14 @@ func (c *Client) OnCustom(eventSubclass string, handler EventHandler) {
 	c.on(EventName{"CUSTOM", eventSubclass}, handler)
 }
 
-// Run an API command, and get the response as a string.
+// Execute runs an API command, and returns the response as a string.
 //
 // This is a blocking (synchronous) method. If you want to discard the result, or execute a call asynchronously, use
 // Query().
+//
+// If you call Connect() followed immediately by Execute() (or one of its siblings) in different goroutines, Execute() will
+// block until Connect() is ready to send your command, or until Timeout is reached. During disconnection or connection
+// failure, if FailOnDisconnect is true, Execute() will return nil with an ENotConnected error.
 //
 // Internally, this method uses the "api" command. If PreventSocketBlocking is true, it will use "bgapi" instead, and
 // block until a response is received. Either way, its behaviour should be the same.
@@ -340,25 +354,18 @@ func (c *Client) MustQuery(app string, args ...string) chan string {
 }
 
 func (c *Client) execute(args []string) (result packet, err error) {
-	var ch chan *command
-	select {
-	case ch = <-c.outbox:
-		if ch == nil {
-			err = ENotConnected
-		}
-	case <-time.After(c.Timeout):
-		err = ETimeout
+	cmd := &command{
+		command:  args,
+		response: make(chan packet),
 	}
-	if err == nil {
-		cmd := &command{
-			command:  args,
-			response: make(chan packet),
-		}
-		ch <- cmd
+	select {
+	case c.outbox <- cmd:
 		result = <-cmd.response
 		if result == nil {
 			err = ENotConnected
 		}
+	case <-time.After(c.Timeout):
+		err = ETimeout
 	}
 	return
 }
