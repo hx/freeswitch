@@ -8,6 +8,7 @@ package freeswitch
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"net/textproto"
@@ -68,7 +69,7 @@ type Client struct {
 }
 
 // EventHandler is a function that can be registered to handle events.
-type EventHandler func(Event)
+type EventHandler func(*Event)
 type handlerMap map[EventName][]EventHandler
 
 type command struct {
@@ -193,7 +194,8 @@ func (c *Client) Connect() (err error) {
 				// We've received an inbound packet from FreeSWITCH
 				case inbound := <-c.inbox:
 					switch p := inbound.cast().(type) {
-					case *inboundEvent:
+					case *Event:
+						p.client = c
 						var handlers []EventHandler
 						exclusive(&c.control, func() {
 							handlers = c.handlers[*p.Name()][:]
@@ -291,6 +293,24 @@ func (c *Client) OnCustom(eventSubclass string, handler EventHandler) {
 	c.on(EventName{"CUSTOM", eventSubclass}, handler)
 }
 
+func (c *Client) sendEvent(e *Event) error {
+	be := *e
+	be.headers = e.headers[:]
+	be.headers.del("Event-Name")
+	result, err := c.execute([]string{"sendevent", e.Name().Name + "\n" + be.String()})
+	if err != nil {
+		return err
+	}
+	if reply, ok := result.(*reply); ok {
+		if reply.ok() {
+			e.Set("Event-UUID", reply.text())
+			return nil
+		}
+		return errors.New(reply.text())
+	}
+	return EUnexpectedResponse
+}
+
 // Execute runs an API command, and returns the response as a string.
 //
 // This is a blocking (synchronous) method. If you want to discard the result, or execute a call asynchronously, use
@@ -357,6 +377,28 @@ func (c *Client) MustQuery(app string, args ...string) chan string {
 	return result
 }
 
+// Create a new event that can be sent into FreeSWITCH.
+func (c *Client) Event(name string) *Event {
+	return &Event{
+		client:  c,
+		headers: headers{{"Event-Name", name}},
+	}
+}
+
+// Create a new CUSTOM event that can be sent into FreeSWITCH.
+func (c *Client) CustomEvent(subclass string) *Event {
+	return c.Event("CUSTOM").Set("Event-Subclass", subclass)
+}
+
+// Load an event from a raw FreeSWITCH packet. This complements the String method of the Event type, which exports
+// events to a format that can be read by this method.
+func (c *Client) LoadEvent(packet string) *Event {
+	return &Event{
+		client:    c,
+		rawPacket: &rawPacket{body: packet},
+	}
+}
+
 func (c *Client) execute(args []string) (result packet, err error) {
 	cmd := &command{
 		command:  args,
@@ -374,7 +416,7 @@ func (c *Client) execute(args []string) (result packet, err error) {
 	return
 }
 
-func (c *Client) bgJobDone(e Event) {
+func (c *Client) bgJobDone(e *Event) {
 	var (
 		resultChan chan string
 		jobID      = e.Get("Job-UUID")

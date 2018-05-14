@@ -67,6 +67,17 @@ func (h headers) String() (str string) {
 	return
 }
 
+// Same as the String method, but percent-escapes the value parts:
+//	Event-Date-Local: 2018-05-04%2004%3A06%3A45\n
+//	Event-Sequence: 79878\n
+//	...etc
+func (h headers) escapedString() (str string) {
+	for _, header := range h {
+		str += header.escapedString()
+	}
+	return
+}
+
 func (h *headers) load(mh textproto.MIMEHeader, unescape bool) {
 	for name, values := range mh {
 		for _, value := range values {
@@ -86,6 +97,16 @@ func (h *header) matchName(name string) bool {
 //	Event-Date-Local: 2018-05-04 04:06:45\n
 func (h *header) String() string {
 	return h.name + ": " + h.value + "\n"
+}
+
+func (h *header) escapedValue() string {
+	return url.PathEscape(h.value)
+}
+
+// Same as the String method, but percent-escapes the value part:
+//	Event-Date-Local: 2018-05-04%2004%3A06%3A45\n
+func (h *header) escapedString() string {
+	return h.name + ": " + h.escapedValue() + "\n"
 }
 
 func loadHeaders(mh textproto.MIMEHeader, unescape bool) headers {

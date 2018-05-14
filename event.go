@@ -9,30 +9,16 @@ import (
 	"time"
 )
 
-// Represents an event raised by FreeSWITCH, and will be passed to your event handlers.
-type Event interface {
-	// Get a value from the event body's headers. An empty string will be returned if the given name
-	// is not present in the event.
-	Get(string) string
-
-	// Get the event's body, excluding its headers, as a string.
-	Body() string
-
-	// Returns the name of the event as an EventName.
-	Name() *EventName
-
-	// The time the event was raised, based on the Event-Date-Timestamp header of the event.
-	Timestamp() *time.Time
-}
-
 // The name and optional subclass of a raised event.
 type EventName struct {
 	Name     string
 	Subclass string
 }
 
-type inboundEvent struct {
+// Represents an event raised by FreeSWITCH, and will be passed to your event handlers.
+type Event struct {
 	*rawPacket
+	client  *Client
 	headers headers
 	body    string
 }
@@ -50,23 +36,48 @@ func (en *EventName) String() string {
 	return en.Name
 }
 
-func (ie *inboundEvent) Name() *EventName {
+// Returns the name of the event as an EventName.
+func (e *Event) Name() *EventName {
 	return &EventName{
-		Name:     ie.Get("Event-Name"),
-		Subclass: ie.Get("Event-Subclass"),
+		Name:     e.Get("Event-Name"),
+		Subclass: e.Get("Event-Subclass"),
 	}
 }
 
-func (ie *inboundEvent) Get(name string) string {
-	ie.read()
-	if ie.headers == nil {
+// Get a value from the event body's headers. An empty string will be returned if the given name
+// is not present in the event.
+func (e *Event) Get(name string) string {
+	e.read()
+	if e.headers == nil {
 		return ""
 	}
-	return ie.headers.get(name)
+	return e.headers.get(name)
 }
 
-func (ie *inboundEvent) Timestamp() (ts *time.Time) {
-	timestamp, err := strconv.Atoi(ie.Get("Event-Date-Timestamp"))
+// Set a value in the event body's header. Empty values will no-op.
+func (e *Event) Set(name string, value string) *Event {
+	if value != "" {
+		e.read()
+		if e.headers == nil {
+			e.headers = headers{}
+		}
+		e.headers.set(name, value)
+	}
+	return e
+}
+
+// Set the event's body.
+func (e *Event) SetBody(value string) *Event {
+	if value != e.body {
+		e.read()
+		e.Set("Content-Length", strconv.Itoa(len(value))).body = value
+	}
+	return e
+}
+
+// The time the event was raised, based on the Event-Date-Timestamp header of the event.
+func (e *Event) Timestamp() (ts *time.Time) {
+	timestamp, err := strconv.Atoi(e.Get("Event-Date-Timestamp"))
 	if err == nil {
 		t := time.Unix(int64(timestamp/1e6), int64(timestamp%1e6*1e3))
 		ts = &t
@@ -74,24 +85,43 @@ func (ie *inboundEvent) Timestamp() (ts *time.Time) {
 	return
 }
 
-func (ie *inboundEvent) Body() string {
-	ie.read()
-	return ie.body
+// Get the event's body, excluding its headers, as a string.
+func (e *Event) Body() string {
+	e.read()
+	return e.body
 }
 
-func (ie *inboundEvent) read() {
-	if ie.headers == nil {
-		reader := bufio.NewReader(strings.NewReader(ie.rawPacket.body))
+// Send the event into FreeSWITCH, and set the Event-UUID header from the resulting event.
+func (e *Event) Send() error {
+	e.read()
+	return e.client.sendEvent(e)
+}
+
+// Get the event's Event-Sequence number. Return value will be zero if no Event-Sequence header is present.
+func (e *Event) Sequence() int {
+	num, _ := strconv.Atoi(e.Get("Event-Sequence"))
+	return num
+}
+
+// Dump the event out to a string, as it would be sent to/from FreeSWITCH.
+func (e *Event) String() string {
+	e.read()
+	return e.headers.escapedString() + "\n" + e.Body()
+}
+
+func (e *Event) read() {
+	if e.headers == nil {
+		reader := bufio.NewReader(strings.NewReader(e.rawPacket.body))
 		mimeHeaders, err := textproto.NewReader(reader).ReadMIMEHeader()
 		if err == nil || err == io.EOF {
-			ie.headers = loadHeaders(mimeHeaders, true)
-			if contentLength, err := strconv.Atoi(ie.headers.get("Content-Length")); err == nil && contentLength > 0 {
+			e.headers = loadHeaders(mimeHeaders, true)
+			if contentLength, err := strconv.Atoi(e.headers.get("Content-Length")); err == nil && contentLength > 0 {
 				body := make([]byte, contentLength)
 				io.ReadFull(reader, body)
-				ie.body = string(body)
+				e.body = string(body)
 			}
 		} else {
-			ie.headers = headers{&header{"Event-Name", err.Error()}}
+			e.headers = headers{&header{"Event-Name", err.Error()}}
 		}
 	}
 }

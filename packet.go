@@ -34,7 +34,7 @@ func (rp *rawPacket) cast() packet {
 	case ptCommandReply:
 		return &reply{rp}
 	case ptEventPlain:
-		return &inboundEvent{rawPacket: rp}
+		return &Event{rawPacket: rp}
 	case ptResult:
 		return &result{rp}
 	case ptDisconnectNotice:
