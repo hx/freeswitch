@@ -22,6 +22,17 @@ func (r *reply) String() string {
 	return r.headers.get("Reply-Text")
 }
 
+func (r *reply) text() (text string) {
+	var (
+		full  = r.String()
+		index = strings.Index(full, " ")
+	)
+	if index >= 0 {
+		text = full[index+1:]
+	}
+	return
+}
+
 func (r *reply) jobID() (uuid string) {
 	return r.headers.get("Job-UUID")
 }
