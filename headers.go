@@ -35,7 +35,7 @@ func (h headers) get(name string) string {
 func (h *headers) del(name string) {
 	if count := len(h.getAll(name)); count > 0 {
 		o := *h
-		n := make(headers, len(o)-count)
+		n := make(headers, 0, len(o)-count)
 		for _, header := range o {
 			if !header.matchName(name) {
 				n = append(n, header)
