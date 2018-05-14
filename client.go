@@ -61,7 +61,7 @@ type Client struct {
 	errors   chan error
 	reading  chan struct{}
 	running  int32
-	handlers map[EventName][]EventHandler
+	handlers handlerMap
 	control  sync.Mutex
 	jobs     map[string]chan string // use jobsJock when reading/writing
 	jobsLock sync.Mutex
@@ -69,6 +69,7 @@ type Client struct {
 
 // EventHandler is a function that can be registered to handle events.
 type EventHandler func(Event)
+type handlerMap map[EventName][]EventHandler
 
 type command struct {
 	command  []string
@@ -84,14 +85,14 @@ func NewClient() *Client {
 		Port:     defaultPort,
 		Timeout:  defaultTimeout,
 
-		inbox:    make(chan *rawPacket),
-		outbox:   make(chan *command),
-		handlers: map[EventName][]EventHandler{},
-		jobs:     map[string]chan string{},
-		errors:   make(chan error),
-		reading:  make(chan struct{}),
+		inbox:   make(chan *rawPacket),
+		outbox:  make(chan *command),
+		jobs:    map[string]chan string{},
+		errors:  make(chan error),
+		reading: make(chan struct{}),
 	}
-	c.handlers[EventName{"BACKGROUND_JOB", ""}] = []EventHandler{c.bgJobDone} // TODO: this, but only when needed
+	// TODO: exclude background job listener when not needed
+	c.handlers = handlerMap{{"BACKGROUND_JOB", ""}: {c.bgJobDone}}
 	c.guessConfiguration()
 	return c
 }
