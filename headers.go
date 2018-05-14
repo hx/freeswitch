@@ -6,8 +6,10 @@ import (
 	"strings"
 )
 
+// A collection of event headers.
 type headers []*header
 
+// Represents a single header in an event.
 type header struct {
 	name  string
 	value string
@@ -54,6 +56,10 @@ func (h headers) getAll(name string) (values []string) {
 	return
 }
 
+// Returns headers in plain text format, e.g.:
+//	Event-Date-Local: 2018-05-04 04:06:45\n
+//	Event-Sequence: 79878\n
+//	...etc
 func (h headers) String() (str string) {
 	for _, header := range h {
 		str += header.String()
@@ -76,6 +82,8 @@ func (h *header) matchName(name string) bool {
 	return strings.ToLower(name) == strings.ToLower(h.name)
 }
 
+// Returns the header in plain text format, e.g.:
+//	Event-Date-Local: 2018-05-04 04:06:45\n
 func (h *header) String() string {
 	return h.name + ": " + h.value + "\n"
 }
