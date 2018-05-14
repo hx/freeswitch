@@ -122,32 +122,43 @@ func (c *Client) Connect() (err error) {
 		// by closing the connection, then waiting on the `reading` channel for it to exit.
 		go c.read()
 
-		// This timeout will cover authentication and event subscription
-		handshakeTimeout := time.After(c.Timeout)
+		var (
+			// This timeout will cover authentication and event subscription.
+			handshakeTimeout = time.After(c.Timeout)
+
+			// Call this function to wait for a packet within the handshake timeout.
+			handshake = func(handler func(*rawPacket)) {
+				if err == nil {
+					select {
+					case packet := <-c.inbox:
+						handler(packet)
+					case <-handshakeTimeout:
+						err = ETimeout
+					}
+				}
+			}
+
+			// Expect an OK response, setting the given error if one is not received.
+			expectOK = func(onFail error) {
+				handshake(func(response *rawPacket) {
+					if result, ok := response.cast().(*reply); !ok || !result.ok() {
+						err = onFail
+					}
+				})
+			}
+		)
 
 		// Wait the given timeout for FreeSWITCH to request authentication and, when requested, send it a password.
-		select {
-		case authPacket := <-c.inbox:
+		handshake(func(authPacket *rawPacket) {
 			if authPacket.packetType() == ptAuthRequest {
 				err = c.write("auth", c.Password)
 			} else {
 				err = EUnexpectedResponse
 			}
-		case <-handshakeTimeout:
-			err = ETimeout
-		}
+		})
 
 		// Still within the auth timeout, wait for an authentication response, and set an error if it fails.
-		if err == nil {
-			select {
-			case authResponse := <-c.inbox:
-				if result, ok := authResponse.cast().(*reply); !ok || !result.ok() {
-					err = EAuthenticationFailed
-				}
-			case <-handshakeTimeout:
-				err = ETimeout
-			}
-		}
+		expectOK(EAuthenticationFailed)
 
 		// Listen to events for already-defined event handlers.
 		if err == nil && len(c.handlers) > 0 {
@@ -157,16 +168,8 @@ func (c *Client) Connect() (err error) {
 			}
 
 			// Send the command and wait for FreeSWITCH to acknowledge the message
-			if err = c.write(eventsSubscriptionCommand(names...)...); err == nil {
-				select {
-				case response := <-c.inbox:
-					if result, ok := response.cast().(*reply); !ok || !result.ok() {
-						err = ECommandFailed
-					}
-				case <-handshakeTimeout:
-					err = ETimeout
-				}
-			}
+			err = c.write(eventsSubscriptionCommand(names...)...)
+			expectOK(ECommandFailed)
 		}
 
 		// Begin normal operation
